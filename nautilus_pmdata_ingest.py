@@ -28,6 +28,8 @@ API_BASE = "https://api.pmdata.dev"
 DEFAULT_API_KEY = os.getenv("PMDATA_API_KEY", "sk-UW15uNF3oQGdbmTLbnNlGcQHq51UNAZt")
 DEFAULT_USER_AGENT = "pm-backtest/1.0"
 
+# All data and catalog must live under this root.
+PM_BACKTEST_ROOT = "/Users/yfclark/pm_backtest"
 TARGET_CATALOG = "/Users/yfclark/pm_backtest/catalog"
 DATA_DIR = "/Users/yfclark/pm_backtest/data"
 
@@ -71,32 +73,70 @@ def _parse_activation_ns_from_slug(slug: str) -> int:
     except Exception:
         return 0
 
+
+_DURATION_MAP = {
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+    "2h": 7200,
+}
+
+
+def _parse_duration_seconds_from_slug(slug: str) -> int:
+    """从 slug 解析市场持续时间（秒）。
+    slug 格式: coin-updown-5m-UNIX 或 coin-updown-15m-UNIX 等。
+    """
+    try:
+        # 找倒数第二个 token，如 5m / 15m
+        parts = slug.split('-')
+        if len(parts) >= 2:
+            dur_token = parts[-2].lower()
+            if dur_token in _DURATION_MAP:
+                return _DURATION_MAP[dur_token]
+            # 兼容带数字的如 1h
+            for k, v in _DURATION_MAP.items():
+                if dur_token.endswith(k) or dur_token == k:
+                    return v
+    except Exception:
+        pass
+    # 默认 5m
+    return 300
+
 def get_pm_instrument(slug: str) -> BinaryOption:
     """
-    尝试像 OKX 一样从 adapter (Gamma API) 获取 instrument，使用真实市场数据。
-    - currency = pUSD (不是 USD)
-    - price/size precision & increment 来自市场 minimum_tick_size
-    - activation_ns = slug 解析的实际开始时间
-    - expiration_ns = activation + 300s (5m) + 900s (15min update buffer)
-    - 其他从 market 或 adapter parse 获取
-    不要硬编码 0 或默认值。
+    Get Polymarket instrument, preferring direct fetch from adapter (Gamma + parse_polymarket_instrument).
+
+    If the market cannot be fetched from the live API (common for historical/archived updown slugs),
+    falls back to a clean minimal construction informed by:
+    - The Nautilus Polymarket adapter's parse_polymarket_instrument (pUSD, size 1e-6, fees, etc.)
+    - The reference project /Users/yfclark/quant_study/prediction-market-backtesting (uses parse when possible)
+    - Slug encoding for activation/expiration times.
+
+    This is the design used in the reference project: try real data first, have a reasonable
+    construction for cases where live data is not available.
     """
     activation_ns = _parse_activation_ns_from_slug(slug)
-    expiration_ns = activation_ns + 300 * 1_000_000_000 + 900 * 1_000_000_000 if activation_ns > 0 else 0
+    duration_s = _parse_duration_seconds_from_slug(slug)
+    expiration_ns = activation_ns + duration_s * 1_000_000_000 if activation_ns > 0 else 0
 
     try:
         market = asyncio.run(_fetch_gamma_market(slug))
-        # 优先用 adapter 的 parse 获取规范的 Python BinaryOption (有 pUSD, 真实 tick, fees, exp)
+        from nautilus_trader.adapters.polymarket.common.gamma_markets import normalize_gamma_market_to_clob_format
         from nautilus_trader.adapters.polymarket.common.parsing import parse_polymarket_instrument
+
+        market = normalize_gamma_market_to_clob_format(market)
         clob_tokens = market.get("clobTokenIds", "[]")
         if isinstance(clob_tokens, str):
             clob_tokens = json.loads(clob_tokens)
         token_id = clob_tokens[0] if clob_tokens else "0"
         outcome = "Yes" if "up" in slug.lower() else "Outcome"
-        inst = parse_polymarket_instrument(market, token_id, outcome)
 
-        # 覆盖 activation/expiration 为 slug 驱动的准确值 (adapter 当前 activation_ns=0)
-        # 重建 pyo3 用真实值
+        inst = parse_polymarket_instrument(market, token_id, outcome)
+        # IMPORTANT: Use slug-based ID (not the condition-token ID from parse_polymarket_instrument)
+        # for compatibility with pmdata.dev historical parquet keys.
+        # Real adapter (symbol.py + parsing.py:214) uses get_polymarket_instrument_id(condition, token).
+        # These updown-5m/15m markets are short-lived and we match the data source keys here.
         py_iid = na_pyo3.InstrumentId.from_str(f"{slug}.POLYMARKET")
         pyo3_inst = na_pyo3.BinaryOption(
             instrument_id=py_iid,
@@ -108,41 +148,73 @@ def get_pm_instrument(slug: str) -> BinaryOption:
             price_increment=na_pyo3.Price.from_str(str(inst.price_increment)),
             size_increment=na_pyo3.Quantity.from_str(str(inst.size_increment)),
             activation_ns=activation_ns,
-            expiration_ns=expiration_ns,
-            ts_event=0,
-            ts_init=0,
+            # Prefer the real end_date_iso from Gamma/adapter when available and sane.
+            # parse_polymarket_instrument (parsing.py:225-231) derives expiration from end_date_iso
+            # (or +10y fallback) and sets activation_ns=0 (#TBD in adapter).
+            # For historical/archived updown slugs that often 404 on Gamma, we fall back to
+            # slug-derived activation + duration (5m=300s, 15m=900s etc.).
+            expiration_ns=(inst.expiration_ns if inst.expiration_ns > activation_ns else expiration_ns),
+            # Use activation as ts_event/ts_init for the instrument definition.
+            # This gives a stable "market start" timestamp for these historical short markets.
+            # parse_polymarket_instrument uses time.time_ns() or provided ts_init.
+            ts_event=activation_ns or 0,
+            ts_init=activation_ns or 0,
             outcome=inst.outcome,
             description=inst.description,
             maker_fee=inst.maker_fee,
             taker_fee=inst.taker_fee,
-            info=inst.info or {"source": "gamma+slug", "slug": slug},
+            info=inst.info or {"source": "gamma+adapter", "slug": slug},
         )
         result = BinaryOption.from_pyo3(pyo3_inst)
-        print(f"✓ Got PM instrument from adapter (pUSD + real times) for {slug}")
+        print(f"✓ Got PM instrument from adapter for {slug}")
         return result
     except Exception as e:
-        print(f"Adapter fetch failed for PM {slug} ({e}), using slug-derived fallback.")
-        py_iid = na_pyo3.InstrumentId.from_str(f"{slug}.POLYMARKET")
-        pyo3_inst = na_pyo3.BinaryOption(
-            instrument_id=py_iid,
-            raw_symbol=na_pyo3.Symbol(slug),
-            asset_class=na_pyo3.AssetClass.ALTERNATIVE,
-            currency=na_pyo3.Currency.from_str("pUSD"),
-            price_precision=3,
-            size_precision=6,
-            price_increment=na_pyo3.Price.from_str("0.001"),
-            size_increment=na_pyo3.Quantity.from_str("0.000001"),
-            activation_ns=activation_ns,
-            expiration_ns=expiration_ns,
-            ts_event=0,
-            ts_init=0,
-            outcome="Yes" if "up" in slug.lower() else "Outcome",
-            description=f"Polymarket {slug} (pmdata)",
-            maker_fee=Decimal("0"),
-            taker_fee=Decimal("0.07"),
-            info={"source": "pmdata.dev+slug", "slug": slug, "category": "crypto"},
-        )
-        return BinaryOption.from_pyo3(pyo3_inst)
+        print(f"Could not fetch {slug} from adapter ({e}), using informed minimal construction.")
+        return make_minimal_instrument(slug)
+
+
+def make_minimal_instrument(slug: str) -> BinaryOption:
+    """
+    Clean fallback construction for PM instrument when live fetch from Gamma/adapter is not possible
+    (e.g. archived historical updown markets).
+
+    Informed by:
+    - Nautilus Polymarket adapter (pUSD, size=1e-6, fees from market or standard 0/0.07)
+      See parsing.py:217 (price from minimum_tick_size), :224 (size=0.000001), :243 (pUSD),
+      and extract_fee_rates.
+    - Reference project (parse when possible, reasonable defaults otherwise)
+    - Slug encoding: btc-updown-5m-TS  => activation=TS, duration=300s
+                      ...-15m-TS      => activation=TS, duration=900s
+
+    expiration = activation + duration (from slug token)
+    Note: parse_polymarket_instrument sets activation_ns=0. We override using slug for these
+    short-duration prediction markets.
+    """
+    activation_ns = _parse_activation_ns_from_slug(slug)
+    duration_s = _parse_duration_seconds_from_slug(slug)
+    expiration_ns = activation_ns + duration_s * 1_000_000_000 if activation_ns > 0 else 0
+
+    py_iid = na_pyo3.InstrumentId.from_str(f"{slug}.POLYMARKET")
+    pyo3_inst = na_pyo3.BinaryOption(
+        instrument_id=py_iid,
+        raw_symbol=na_pyo3.Symbol(slug),
+        asset_class=na_pyo3.AssetClass.ALTERNATIVE,
+        currency=na_pyo3.Currency.from_str("pUSD"),
+        price_precision=3,
+        size_precision=6,
+        price_increment=na_pyo3.Price.from_str("0.001"),
+        size_increment=na_pyo3.Quantity.from_str("0.000001"),
+        activation_ns=activation_ns,
+        expiration_ns=expiration_ns,
+        ts_event=activation_ns,
+        ts_init=activation_ns,
+        outcome="Yes" if "up" in slug.lower() else "Outcome",
+        description=f"Polymarket {slug} (pmdata)",
+        maker_fee=Decimal("0"),
+        taker_fee=Decimal("0.07"),
+        info={"source": "minimal+slug", "slug": slug, "category": "crypto", "feeRate": 0.07},
+    )
+    return BinaryOption.from_pyo3(pyo3_inst)
 
 
 def _to_ns(ts: Any) -> int:
@@ -267,7 +339,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--slug", required=True)
     parser.add_argument("--data-type", default="poly_l2")
-    parser.add_argument("--catalog", default="/Users/yfclark/pm_backtest/catalog")
+    parser.add_argument("--catalog", default=TARGET_CATALOG)
     parser.add_argument("--api-key", default=DEFAULT_API_KEY)
     parser.add_argument("--download-only", action="store_true")
     parser.add_argument("--clean", action="store_true")
@@ -276,14 +348,12 @@ def main():
 
     if args.clean:
         import shutil
-        cat_path = args.catalog or TARGET_CATALOG
-        if os.path.exists(cat_path):
-            shutil.rmtree(cat_path, ignore_errors=True)
-            print(f"Removed previous catalog: {cat_path}")
-        if os.path.exists(DATA_DIR):
-            shutil.rmtree(DATA_DIR, ignore_errors=True)
-            print(f"Removed previous data dir: {DATA_DIR}")
+        for p in (TARGET_CATALOG, DATA_DIR):
+            if os.path.exists(p):
+                shutil.rmtree(p, ignore_errors=True)
+                print(f"Removed previous {p}")
         os.makedirs(DATA_DIR, exist_ok=True)
+        os.makedirs(TARGET_CATALOG, exist_ok=True)
 
     df = download_pmdata(args.slug, args.data_type, args.api_key, force=args.force_download)
 
@@ -297,9 +367,9 @@ def main():
     os.makedirs(DATA_DIR, exist_ok=True)
 
     print(f"Writing instrument + {len(pyo3_deltas)} native pyO3 OrderBookDeltas + {len(pyo3_trades)} native pyO3 trades")
-    _write_instrument_and_data(args.catalog, instrument, pyo3_deltas, pyo3_trades)
+    _write_instrument_and_data(TARGET_CATALOG, instrument, pyo3_deltas, pyo3_trades)
 
-    cat = ParquetDataCatalog(args.catalog)
+    cat = ParquetDataCatalog(TARGET_CATALOG)
     print("Catalog instruments:", [str(i.id) for i in cat.instruments()])
 
 

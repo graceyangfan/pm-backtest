@@ -30,6 +30,7 @@ from nautilus_trader.core import nautilus_pyo3 as na_pyo3
 
 import asyncio
 
+PM_BACKTEST_ROOT = "/Users/yfclark/pm_backtest"
 TARGET_CATALOG = "/Users/yfclark/pm_backtest/catalog"
 DATA_DIR = "/Users/yfclark/pm_backtest/data"
 
@@ -56,6 +57,9 @@ def get_okx_spot_instrument(symbol: str = "BTC-USDT") -> CurrencyPair:
         pyo3_instruments, _ = await client.request_instruments(
             na_pyo3.OKXInstrumentType.SPOT, None
         )
+        # Follow real OKX adapter: cache instruments after request (data.py:274, 556, 780)
+        for py_inst in pyo3_instruments:
+            client.cache_instrument(py_inst)
         all_instruments = instruments_from_pyo3(pyo3_instruments)
         target_id = InstrumentId.from_str(f"{symbol}.OKX")
         for inst in all_instruments:
@@ -68,13 +72,37 @@ def get_okx_spot_instrument(symbol: str = "BTC-USDT") -> CurrencyPair:
 
 
 def write_okx_spot_instruments(symbols: list[str] | None = None, catalog_path: str = TARGET_CATALOG):
-    """写入 OKX spot instruments（总是从 live adapter 获取）。"""
+    """写入 OKX spot instruments（总是从 live adapter 获取）。
+    
+    Optimized: fetch the full SPOT list once (as the pyo3 client does internally),
+    then pick requested symbols. Avoids repeated full requests per symbol.
+    """
     if symbols is None:
         symbols = ["BTC-USDT", "ETH-USDT", "XRP-USDT", "SOL-USDT", "DOGE-USDT"]
     os.makedirs(catalog_path, exist_ok=True)
     cat = ParquetDataCatalog(catalog_path)
+
+    # One fetch for all requested symbols (matches how real OKX provider works)
+    async def _fetch_all():
+        client = na_pyo3.OKXHttpClient(
+            api_key="", api_secret="", api_passphrase="",
+            environment=na_pyo3.OKXEnvironment.LIVE,
+        )
+        pyo3_instruments, _ = await client.request_instruments(
+            na_pyo3.OKXInstrumentType.SPOT, None
+        )
+        for py_inst in pyo3_instruments:
+            client.cache_instrument(py_inst)
+        return instruments_from_pyo3(pyo3_instruments)
+
+    all_insts = asyncio.run(_fetch_all())
+    inst_map = {str(i.id).split(".")[0]: i for i in all_insts}  # e.g. "BTC-USDT" -> inst
+
     for sym in symbols:
-        inst = get_okx_spot_instrument(sym)
+        inst = inst_map.get(sym)
+        if inst is None:
+            # fallback to single fetch (rare)
+            inst = get_okx_spot_instrument(sym)
         cat.write_data([inst])
         print(f"✓ Written instrument: {inst.id}")
 
@@ -138,8 +166,12 @@ def load_okx_spot_l2_to_pyo3(path: str, instrument: CurrencyPair) -> list:
     pyo3_deltas = []
     py_iid = na_pyo3.InstrumentId.from_str(str(instrument.id))
 
-    F_S = 32   # F_SNAPSHOT
-    F_L = 128  # F_LAST
+    # Use enum values (matches model/enums.py:438-440 and PM side usage)
+    F_S = na_pyo3.RecordFlag.F_SNAPSHOT
+    F_L = na_pyo3.RecordFlag.F_LAST
+
+    # Derive expected instId from instrument for validation (e.g. "BTC-USDT")
+    expected_inst = str(instrument.id).split(".")[0]
 
     with open(path, "r") as f:
         for line in f:
@@ -147,6 +179,12 @@ def load_okx_spot_l2_to_pyo3(path: str, instrument: CurrencyPair) -> list:
             if not line:
                 continue
             row = json.loads(line)
+
+            # Optional sanity: row should match requested instrument (defensive, per review feedback)
+            row_inst = row.get("instId")
+            if row_inst and row_inst != expected_inst:
+                continue
+
             # OKX L2 orderbook historical (.data NDJSON) "ts" unit is MILLISECONDS.
             # Hard rule for this source only — no guessing.
             #
@@ -163,17 +201,17 @@ def load_okx_spot_l2_to_pyo3(path: str, instrument: CurrencyPair) -> list:
             bids = row.get("bids", []) or []
             asks = row.get("asks", []) or []
 
+            # Limit to 400 levels (matches the 400lv tarball format)
+            bids_lv = bids[:400]
+            asks_lv = asks[:400]
+
             deltas = []
-            dummy = na_pyo3.BookOrder(
-                side=na_pyo3.OrderSide.NO_ORDER_SIDE,
-                price=na_pyo3.Price.from_str("0"),
-                size=na_pyo3.Quantity.from_str("0"),
-                order_id=0,
-            )
+            # Use order=None for CLEAR to be consistent with Polymarket adapter schema
+            # (schemas/book.py:70) and other Nautilus snapshot patterns.
             clear = na_pyo3.OrderBookDelta(
                 instrument_id=py_iid,
                 action=na_pyo3.BookAction.CLEAR,
-                order=dummy,
+                order=None,
                 flags=F_S,
                 sequence=0,
                 ts_event=ts_ns,
@@ -181,7 +219,7 @@ def load_okx_spot_l2_to_pyo3(path: str, instrument: CurrencyPair) -> list:
             )
             deltas.append(clear)
 
-            for i, level in enumerate(bids[:400]):
+            for i, level in enumerate(bids_lv):
                 if len(level) < 2:
                     continue
                 size_str = str(level[1])
@@ -194,7 +232,7 @@ def load_okx_spot_l2_to_pyo3(path: str, instrument: CurrencyPair) -> list:
                     order_id=0,
                 )
                 flags = F_S
-                if i == len(bids[:400]) - 1 and not asks:
+                if i == len(bids_lv) - 1 and not asks_lv:
                     flags |= F_L
                 deltas.append(
                     na_pyo3.OrderBookDelta(
@@ -208,7 +246,7 @@ def load_okx_spot_l2_to_pyo3(path: str, instrument: CurrencyPair) -> list:
                     )
                 )
 
-            for i, level in enumerate(asks[:400]):
+            for i, level in enumerate(asks_lv):
                 if len(level) < 2:
                     continue
                 size_str = str(level[1])
@@ -221,7 +259,7 @@ def load_okx_spot_l2_to_pyo3(path: str, instrument: CurrencyPair) -> list:
                     order_id=0,
                 )
                 flags = F_S
-                if i == len(asks[:400]) - 1:
+                if i == len(asks_lv) - 1:
                     flags |= F_L
                 deltas.append(
                     na_pyo3.OrderBookDelta(
@@ -236,6 +274,8 @@ def load_okx_spot_l2_to_pyo3(path: str, instrument: CurrencyPair) -> list:
                 )
 
             if len(deltas) > 1:
+                # Emit batch only when we have CLEAR + at least one level.
+                # Pattern mirrors deribit/data.py:731 and polymarket book snapshots.
                 pyo3_deltas.append(na_pyo3.OrderBookDeltas(instrument_id=py_iid, deltas=deltas))
 
     return pyo3_deltas
@@ -254,7 +294,7 @@ def main():
     catalog = TARGET_CATALOG
 
     if args.clean:
-        print(f"[CLEAN] Removing old catalog and data under /Users/yfclark/pm_backtest")
+        print(f"[CLEAN] Removing old catalog and data under {PM_BACKTEST_ROOT}")
         if os.path.exists(catalog):
             shutil.rmtree(catalog, ignore_errors=True)
         if os.path.exists(DATA_DIR):
@@ -264,7 +304,7 @@ def main():
 
     if args.action == "instruments":
         syms = [s.strip() for s in args.symbols.split(",")]
-        write_okx_spot_instruments(syms, catalog)
+        write_okx_spot_instruments(syms, TARGET_CATALOG)
 
     elif args.action == "download-l2":
         data_path = download_okx_spot_l2_orderbook(args.date, args.symbol)
@@ -276,9 +316,9 @@ def main():
         inst = get_okx_spot_instrument(args.symbol)
         deltas = load_okx_spot_l2_to_pyo3(args.data_file, inst)
 
-        _write_instrument_and_data(catalog, inst, deltas)
+        _write_instrument_and_data(TARGET_CATALOG, inst, deltas)
 
-        cat = ParquetDataCatalog(catalog)
+        cat = ParquetDataCatalog(TARGET_CATALOG)
         read = list(cat.query_order_book_deltas(instrument_ids=[inst.id]))
         print(f"Read back {len(read)} OrderBookDeltas batches")
 
