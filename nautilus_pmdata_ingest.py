@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """
-PMData.dev -> Nautilus Trader 独立转换脚本（Polymarket only）
+PMData.dev -> Nautilus Trader catalog writer for Polymarket up/down markets.
 
-完全在当前 pm_backtest 目录实现。
+Design notes:
+- We write two BinaryOption instruments per market: YES and NO.
+- PMData historical parquet is treated as the YES-side book; the NO-side book is
+  derived by complementing prices around 1.0.
+- `market_resolved` rows are converted into `InstrumentClose` events so Nautilus
+  can settle open YES/NO positions at expiry inside the official backtest engine.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 from decimal import Decimal
@@ -16,26 +22,37 @@ from typing import Any
 
 import pandas as pd
 
-from nautilus_trader.model.instruments import BinaryOption
-from nautilus_trader.model.currencies import Currency
-from nautilus_trader.model.objects import Price, Quantity
-from nautilus_trader.persistence.catalog import ParquetDataCatalog
-
 from nautilus_trader.core import nautilus_pyo3 as na_pyo3
+from nautilus_trader.model.data import BookOrder
+from nautilus_trader.model.data import InstrumentClose
+from nautilus_trader.model.data import OrderBookDelta
+from nautilus_trader.model.data import OrderBookDeltas
+from nautilus_trader.model.data import TradeTick
+from nautilus_trader.model.enums import AggressorSide
+from nautilus_trader.model.enums import BookAction
+from nautilus_trader.model.enums import InstrumentCloseType
+from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import RecordFlag
+from nautilus_trader.model.identifiers import TradeId
+from nautilus_trader.model.instruments import BinaryOption
+from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 
 API_BASE = "https://api.pmdata.dev"
 DEFAULT_API_KEY = os.getenv("PMDATA_API_KEY", "sk-UW15uNF3oQGdbmTLbnNlGcQHq51UNAZt")
 DEFAULT_USER_AGENT = "pm-backtest/1.0"
 
-# All data and catalog must live under this root.
 PM_BACKTEST_ROOT = "/Users/yfclark/pm_backtest"
-TARGET_CATALOG = "/Users/yfclark/pm_backtest/catalog"
-DATA_DIR = "/Users/yfclark/pm_backtest/data"
+TARGET_CATALOG = f"{PM_BACKTEST_ROOT}/catalog"
+DATA_DIR = f"{PM_BACKTEST_ROOT}/data"
 
 
-def download_pmdata(slug: str, data_type: str = "poly_l2", api_key: str = DEFAULT_API_KEY, force: bool = False) -> pd.DataFrame:
-    """Download from pmdata.dev and save to ./data/ in current directory."""
+def download_pmdata(
+    slug: str,
+    data_type: str = "poly_l2",
+    api_key: str = DEFAULT_API_KEY,
+    force: bool = False,
+) -> pd.DataFrame:
     os.makedirs(DATA_DIR, exist_ok=True)
     local_path = os.path.join(DATA_DIR, f"{slug}.parquet")
 
@@ -45,14 +62,16 @@ def download_pmdata(slug: str, data_type: str = "poly_l2", api_key: str = DEFAUL
 
     url = f"{API_BASE}/download/{data_type}/{slug}.parquet"
     print(f"Downloading {url} -> {local_path}")
-    df = pd.read_parquet(url, storage_options={"api_key": api_key, "User-Agent": DEFAULT_USER_AGENT})
+    df = pd.read_parquet(
+        url,
+        storage_options={"api_key": api_key, "User-Agent": DEFAULT_USER_AGENT},
+    )
     df.to_parquet(local_path)
     print(f"  Saved locally. rows={len(df)}, events={dict(df['event_type'].value_counts())}")
     return df
 
 
 async def _fetch_gamma_market(slug: str) -> dict:
-    """从 Gamma API (Polymarket adapter style) 获取市场信息，用于获取真实精度、费用等。"""
     client = na_pyo3.HttpClient()
     url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
     resp = await client.get(url, timeout_secs=30)
@@ -63,13 +82,10 @@ async def _fetch_gamma_market(slug: str) -> dict:
         raise ValueError(f"No market found for slug {slug}")
     return markets[0]
 
+
 def _parse_activation_ns_from_slug(slug: str) -> int:
-    """从 slug 解析 activation 时间 (unix seconds -> ns)。
-    e.g. btc-updown-5m-1778803200 -> 1778803200 * 1e9
-    """
     try:
-        ts = int(slug.split('-')[-1])
-        return ts * 1_000_000_000
+        return int(slug.split("-")[-1]) * 1_000_000_000
     except Exception:
         return 0
 
@@ -84,120 +100,77 @@ _DURATION_MAP = {
 
 
 def _parse_duration_seconds_from_slug(slug: str) -> int:
-    """从 slug 解析市场持续时间（秒）。
-    slug 格式: coin-updown-5m-UNIX 或 coin-updown-15m-UNIX 等。
-    """
     try:
-        # 找倒数第二个 token，如 5m / 15m
-        parts = slug.split('-')
+        parts = slug.split("-")
         if len(parts) >= 2:
-            dur_token = parts[-2].lower()
-            if dur_token in _DURATION_MAP:
-                return _DURATION_MAP[dur_token]
-            # 兼容带数字的如 1h
-            for k, v in _DURATION_MAP.items():
-                if dur_token.endswith(k) or dur_token == k:
-                    return v
+            token = parts[-2].lower()
+            if token in _DURATION_MAP:
+                return _DURATION_MAP[token]
     except Exception:
         pass
-    # 默认 5m
     return 300
 
-def get_pm_instrument(slug: str) -> BinaryOption:
-    """
-    Get Polymarket instrument, preferring direct fetch from adapter (Gamma + parse_polymarket_instrument).
 
-    If the market cannot be fetched from the live API (common for historical/archived updown slugs),
-    falls back to a clean minimal construction informed by:
-    - The Nautilus Polymarket adapter's parse_polymarket_instrument (pUSD, size 1e-6, fees, etc.)
-    - The reference project /Users/yfclark/quant_study/prediction-market-backtesting (uses parse when possible)
-    - Slug encoding for activation/expiration times.
+def _parse_token_outcomes(market: dict[str, Any]) -> tuple[str | None, str | None, str | None, str | None]:
+    token_ids = market.get("clobTokenIds", [])
+    outcomes = market.get("outcomes", [])
+    if isinstance(token_ids, str):
+        token_ids = json.loads(token_ids)
+    if isinstance(outcomes, str):
+        outcomes = json.loads(outcomes)
+    if not isinstance(token_ids, list) or len(token_ids) < 2:
+        return None, None, None, None
 
-    This is the design used in the reference project: try real data first, have a reasonable
-    construction for cases where live data is not available.
-    """
-    activation_ns = _parse_activation_ns_from_slug(slug)
-    duration_s = _parse_duration_seconds_from_slug(slug)
-    expiration_ns = activation_ns + duration_s * 1_000_000_000 if activation_ns > 0 else 0
+    yes_token = None
+    no_token = None
+    yes_outcome = "Yes"
+    no_outcome = "No"
+    for token_id, outcome in zip(token_ids, outcomes, strict=False):
+        token = str(token_id).strip()
+        outcome_str = str(outcome).strip()
+        normalized = outcome_str.lower()
+        if normalized in {"yes", "up", "higher", "above"} and yes_token is None:
+            yes_token = token
+            yes_outcome = outcome_str or "Yes"
+        elif normalized in {"no", "down", "lower", "below"} and no_token is None:
+            no_token = token
+            no_outcome = outcome_str or "No"
 
-    try:
-        market = asyncio.run(_fetch_gamma_market(slug))
-        from nautilus_trader.adapters.polymarket.common.gamma_markets import normalize_gamma_market_to_clob_format
-        from nautilus_trader.adapters.polymarket.common.parsing import parse_polymarket_instrument
-
-        market = normalize_gamma_market_to_clob_format(market)
-        clob_tokens = market.get("clobTokenIds", "[]")
-        if isinstance(clob_tokens, str):
-            clob_tokens = json.loads(clob_tokens)
-        token_id = clob_tokens[0] if clob_tokens else "0"
-        outcome = "Yes" if "up" in slug.lower() else "Outcome"
-
-        inst = parse_polymarket_instrument(market, token_id, outcome)
-        # IMPORTANT: Use slug-based ID (not the condition-token ID from parse_polymarket_instrument)
-        # for compatibility with pmdata.dev historical parquet keys.
-        # Real adapter (symbol.py + parsing.py:214) uses get_polymarket_instrument_id(condition, token).
-        # These updown-5m/15m markets are short-lived and we match the data source keys here.
-        py_iid = na_pyo3.InstrumentId.from_str(f"{slug}.POLYMARKET")
-        pyo3_inst = na_pyo3.BinaryOption(
-            instrument_id=py_iid,
-            raw_symbol=na_pyo3.Symbol(slug),
-            asset_class=na_pyo3.AssetClass.ALTERNATIVE,
-            currency=na_pyo3.Currency.from_str("pUSD"),
-            price_precision=inst.price_precision,
-            size_precision=inst.size_precision,
-            price_increment=na_pyo3.Price.from_str(str(inst.price_increment)),
-            size_increment=na_pyo3.Quantity.from_str(str(inst.size_increment)),
-            activation_ns=activation_ns,
-            # Prefer the real end_date_iso from Gamma/adapter when available and sane.
-            # parse_polymarket_instrument (parsing.py:225-231) derives expiration from end_date_iso
-            # (or +10y fallback) and sets activation_ns=0 (#TBD in adapter).
-            # For historical/archived updown slugs that often 404 on Gamma, we fall back to
-            # slug-derived activation + duration (5m=300s, 15m=900s etc.).
-            expiration_ns=(inst.expiration_ns if inst.expiration_ns > activation_ns else expiration_ns),
-            # Use activation as ts_event/ts_init for the instrument definition.
-            # This gives a stable "market start" timestamp for these historical short markets.
-            # parse_polymarket_instrument uses time.time_ns() or provided ts_init.
-            ts_event=activation_ns or 0,
-            ts_init=activation_ns or 0,
-            outcome=inst.outcome,
-            description=inst.description,
-            maker_fee=inst.maker_fee,
-            taker_fee=inst.taker_fee,
-            info=inst.info or {"source": "gamma+adapter", "slug": slug},
-        )
-        result = BinaryOption.from_pyo3(pyo3_inst)
-        print(f"✓ Got PM instrument from adapter for {slug}")
-        return result
-    except Exception as e:
-        print(f"Could not fetch {slug} from adapter ({e}), using informed minimal construction.")
-        return make_minimal_instrument(slug)
+    if yes_token is None:
+        yes_token = str(token_ids[0]).strip()
+    if no_token is None:
+        no_token = str(token_ids[1]).strip()
+    return yes_token, no_token, yes_outcome, no_outcome
 
 
-def make_minimal_instrument(slug: str) -> BinaryOption:
-    """
-    Clean fallback construction for PM instrument when live fetch from Gamma/adapter is not possible
-    (e.g. archived historical updown markets).
+def _surrogate_instrument_id(slug: str, side: str) -> str:
+    return f"{slug}-{side.upper()}.POLYMARKET"
 
-    Informed by:
-    - Nautilus Polymarket adapter (pUSD, size=1e-6, fees from market or standard 0/0.07)
-      See parsing.py:217 (price from minimum_tick_size), :224 (size=0.000001), :243 (pUSD),
-      and extract_fee_rates.
-    - Reference project (parse when possible, reasonable defaults otherwise)
-    - Slug encoding: btc-updown-5m-TS  => activation=TS, duration=300s
-                      ...-15m-TS      => activation=TS, duration=900s
 
-    expiration = activation + duration (from slug token)
-    Note: parse_polymarket_instrument sets activation_ns=0. We override using slug for these
-    short-duration prediction markets.
-    """
-    activation_ns = _parse_activation_ns_from_slug(slug)
-    duration_s = _parse_duration_seconds_from_slug(slug)
-    expiration_ns = activation_ns + duration_s * 1_000_000_000 if activation_ns > 0 else 0
+def _base_info(slug: str, side: str, complement_id: str) -> dict[str, Any]:
+    return {
+        "source": "pmdata_dual_binary",
+        "slug": slug,
+        "pmdata_slug": slug,
+        "pair_role": side.lower(),
+        "complement_instrument_id": complement_id,
+        "category": "crypto",
+        "feeRate": 0.07,
+    }
 
-    py_iid = na_pyo3.InstrumentId.from_str(f"{slug}.POLYMARKET")
+
+def _make_minimal_binary_option(
+    instrument_id: str,
+    raw_symbol: str,
+    outcome: str,
+    description: str,
+    activation_ns: int,
+    expiration_ns: int,
+    info: dict[str, Any],
+) -> BinaryOption:
     pyo3_inst = na_pyo3.BinaryOption(
-        instrument_id=py_iid,
-        raw_symbol=na_pyo3.Symbol(slug),
+        instrument_id=na_pyo3.InstrumentId.from_str(instrument_id),
+        raw_symbol=na_pyo3.Symbol(raw_symbol),
         asset_class=na_pyo3.AssetClass.ALTERNATIVE,
         currency=na_pyo3.Currency.from_str("pUSD"),
         price_precision=3,
@@ -208,38 +181,160 @@ def make_minimal_instrument(slug: str) -> BinaryOption:
         expiration_ns=expiration_ns,
         ts_event=activation_ns,
         ts_init=activation_ns,
-        outcome="Yes" if "up" in slug.lower() else "Outcome",
-        description=f"Polymarket {slug} (pmdata)",
+        outcome=outcome,
+        description=description,
         maker_fee=Decimal("0"),
         taker_fee=Decimal("0.07"),
-        info={"source": "minimal+slug", "slug": slug, "category": "crypto", "feeRate": 0.07},
+        info=info,
     )
     return BinaryOption.from_pyo3(pyo3_inst)
 
 
-def _to_ns(ts: Any) -> int:
-    """Convert pmdata "timestamp" to nanoseconds.
+def get_pm_instruments(slug: str) -> tuple[BinaryOption, BinaryOption]:
+    activation_ns = _parse_activation_ns_from_slug(slug)
+    duration_s = _parse_duration_seconds_from_slug(slug)
+    expiration_ns = activation_ns + duration_s * 1_000_000_000 if activation_ns > 0 else 0
 
-    What it actually is for pmdata.dev:
-    The "timestamp" column is **seconds** (unix timestamp, float with fractional part is fine).
-    Verified by inspecting multiple pmdata parquet files + usage in other polymarket repos.
-    No heuristics. Direct conversion.
-    """
+    try:
+        market = asyncio.run(_fetch_gamma_market(slug))
+        from nautilus_trader.adapters.polymarket.common.gamma_markets import (
+            normalize_gamma_market_to_clob_format,
+        )
+        from nautilus_trader.adapters.polymarket.common.parsing import (
+            parse_polymarket_instrument,
+        )
+
+        market = normalize_gamma_market_to_clob_format(market)
+        yes_token, no_token, yes_outcome, no_outcome = _parse_token_outcomes(market)
+        if not yes_token or not no_token:
+            raise ValueError("missing token pair")
+
+        yes_inst = parse_polymarket_instrument(market, yes_token, yes_outcome)
+        no_inst = parse_polymarket_instrument(market, no_token, no_outcome)
+
+        yes_iid = yes_inst.id.value
+        no_iid = no_inst.id.value
+        yes_info = dict(yes_inst.info or {})
+        no_info = dict(no_inst.info or {})
+        yes_info.update(_base_info(slug, "yes", no_iid))
+        no_info.update(_base_info(slug, "no", yes_iid))
+
+        yes = _make_minimal_binary_option(
+            instrument_id=yes_iid,
+            raw_symbol=str(yes_inst.raw_symbol),
+            outcome=yes_inst.outcome,
+            description=yes_inst.description,
+            activation_ns=activation_ns,
+            expiration_ns=max(yes_inst.expiration_ns, expiration_ns),
+            info=yes_info,
+        )
+        no = _make_minimal_binary_option(
+            instrument_id=no_iid,
+            raw_symbol=str(no_inst.raw_symbol),
+            outcome=no_inst.outcome,
+            description=no_inst.description,
+            activation_ns=activation_ns,
+            expiration_ns=max(no_inst.expiration_ns, expiration_ns),
+            info=no_info,
+        )
+        print(f"✓ Got PM YES/NO instruments from adapter for {slug}")
+        return yes, no
+    except Exception as e:
+        print(f"Could not fetch {slug} from adapter ({e}), using deterministic slug-based pair.")
+
+    yes_id = _surrogate_instrument_id(slug, "yes")
+    no_id = _surrogate_instrument_id(slug, "no")
+    yes = _make_minimal_binary_option(
+        instrument_id=yes_id,
+        raw_symbol=f"{slug}-YES",
+        outcome="Yes",
+        description=f"Polymarket {slug} YES (pmdata)",
+        activation_ns=activation_ns,
+        expiration_ns=expiration_ns,
+        info=_base_info(slug, "yes", no_id),
+    )
+    no = _make_minimal_binary_option(
+        instrument_id=no_id,
+        raw_symbol=f"{slug}-NO",
+        outcome="No",
+        description=f"Polymarket {slug} NO (pmdata)",
+        activation_ns=activation_ns,
+        expiration_ns=expiration_ns,
+        info=_base_info(slug, "no", yes_id),
+    )
+    return yes, no
+
+
+def _to_ns(ts: Any) -> int:
     if pd.isna(ts):
         return 0
-    return int(pd.to_datetime(float(ts), unit="s", utc=True).value)
+    return int(pd.to_datetime(ts, utc=True).value)
 
 
-def pmdata_parquet_to_nautilus_pyo3(
-    df: pd.DataFrame,
+def _build_trade_id(row: pd.Series, ts_event: int, side_tag: str) -> str:
+    market_slug = str(row.get("market_slug") or "")
+    local_ts_ns = _to_ns(row.get("local_timestamp"))
+    side = str(row.get("trade_side") or "").upper()
+    price = row.get("trade_price")
+    size = row.get("trade_size")
+    payload = f"{market_slug}|{side_tag}|{ts_event}|{local_ts_ns}|{side}|{price}|{size}"
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()
+
+
+def _complement_price(price: float) -> float:
+    return max(0.0, min(1.0, 1.0 - price))
+
+
+def _level_values(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, float) and pd.isna(value):
+        return []
+    return list(value)
+
+
+def _make_single_delta(
     instrument: BinaryOption,
-) -> tuple[list[Any], list[Any]]:
-    """直接使用原生 pyO3 对象构造。"""
-    df = df.sort_values("timestamp").reset_index(drop=True)
-    py_iid = na_pyo3.InstrumentId.from_str(str(instrument.id))
+    action: BookAction,
+    side: OrderSide,
+    price: float,
+    size: float,
+    flags: int,
+    ts_event: int,
+    ts_init: int,
+) -> OrderBookDelta:
+    return OrderBookDelta(
+        instrument_id=instrument.id,
+        action=action,
+        order=BookOrder(
+            side=side,
+            price=instrument.make_price(price),
+            size=instrument.make_qty(size),
+            order_id=0,
+        ),
+        flags=flags,
+        sequence=0,
+        ts_event=ts_event,
+        ts_init=ts_init,
+    )
 
-    pyo3_deltas_batches: list[Any] = []
-    pyo3_trades: list[Any] = []
+
+def pmdata_parquet_to_nautilus(
+    df: pd.DataFrame,
+    yes_instrument: BinaryOption,
+    no_instrument: BinaryOption,
+) -> tuple[list[Any], list[Any], list[Any], list[Any], list[Any]]:
+    sort_col = "local_timestamp" if "local_timestamp" in df.columns else "timestamp"
+    df = df.sort_values(sort_col).reset_index(drop=True)
+
+    yes_batches: list[Any] = []
+    yes_trades: list[Any] = []
+    no_batches: list[Any] = []
+    no_trades: list[Any] = []
+    closes: list[Any] = []
+
+    f_snapshot = RecordFlag.F_SNAPSHOT
+    f_last = RecordFlag.F_LAST
 
     for _, row in df.iterrows():
         ev = str(row.get("event_type", ""))
@@ -247,95 +342,240 @@ def pmdata_parquet_to_nautilus_pyo3(
         ts_init = _to_ns(row.get("local_timestamp") or row.get("timestamp"))
 
         if ev == "book":
-            bp = row.get("bid_prices")
-            bs = row.get("bid_sizes")
-            ap = row.get("ask_prices")
-            asz = row.get("ask_sizes")
-            bids_p = list(bp) if bp is not None else []
-            bids_s = list(bs) if bs is not None else []
-            asks_p = list(ap) if ap is not None else []
-            asks_s = list(asz) if asz is not None else []
+            bids_p = _level_values(row.get("bid_prices"))
+            bids_s = _level_values(row.get("bid_sizes"))
+            asks_p = _level_values(row.get("ask_prices"))
+            asks_s = _level_values(row.get("ask_sizes"))
 
-            deltas: list[Any] = []
-            clear = na_pyo3.OrderBookDelta(
-                instrument_id=py_iid,
-                action=na_pyo3.BookAction.CLEAR,
-                order=None,
-                flags=na_pyo3.RecordFlag.F_SNAPSHOT,
-                sequence=0,
-                ts_event=ts_event,
-                ts_init=ts_init,
-            )
-            deltas.append(clear)
+            yes_deltas: list[Any] = [
+                OrderBookDelta(
+                    instrument_id=yes_instrument.id,
+                    action=BookAction.CLEAR,
+                    order=None,
+                    flags=f_snapshot,
+                    sequence=0,
+                    ts_event=ts_event,
+                    ts_init=ts_init,
+                ),
+            ]
+            no_deltas: list[Any] = [
+                OrderBookDelta(
+                    instrument_id=no_instrument.id,
+                    action=BookAction.CLEAR,
+                    order=None,
+                    flags=f_snapshot,
+                    sequence=0,
+                    ts_event=ts_event,
+                    ts_init=ts_init,
+                ),
+            ]
 
-            for i, (p, s) in enumerate(zip(bids_p, bids_s)):
-                if p is None or s is None or float(s) <= 0:
+            for p, s in zip(bids_p, bids_s):
+                if p is None or s is None or float(s) <= 0.0:
                     continue
-                flags = na_pyo3.RecordFlag.F_SNAPSHOT
-                if (i == len(bids_p) - 1) and len(asks_p) == 0:
-                    flags |= na_pyo3.RecordFlag.F_LAST
-                price = na_pyo3.Price.from_str(str(float(p)))
-                size = na_pyo3.Quantity.from_str(str(float(s)))
-                bo = na_pyo3.BookOrder(side=na_pyo3.OrderSide.BUY, price=price, size=size, order_id=0)
-                deltas.append(na_pyo3.OrderBookDelta(instrument_id=py_iid, action=na_pyo3.BookAction.ADD, order=bo, flags=flags, sequence=0, ts_event=ts_event, ts_init=ts_init))
+                price = round(float(p), yes_instrument.price_precision)
+                size = float(s)
+                yes_deltas.append(
+                    _make_single_delta(
+                        yes_instrument,
+                        BookAction.ADD,
+                        OrderSide.BUY,
+                        price,
+                        size,
+                        f_snapshot,
+                        ts_event,
+                        ts_init,
+                    ),
+                )
+                no_deltas.append(
+                    _make_single_delta(
+                        no_instrument,
+                        BookAction.ADD,
+                        OrderSide.SELL,
+                        round(_complement_price(price), no_instrument.price_precision),
+                        size,
+                        f_snapshot,
+                        ts_event,
+                        ts_init,
+                    ),
+                )
 
-            for i, (p, s) in enumerate(zip(asks_p, asks_s)):
-                if p is None or s is None or float(s) <= 0:
+            for p, s in zip(asks_p, asks_s):
+                if p is None or s is None or float(s) <= 0.0:
                     continue
-                flags = na_pyo3.RecordFlag.F_SNAPSHOT
-                if i == len(asks_p) - 1:
-                    flags |= na_pyo3.RecordFlag.F_LAST
-                price = na_pyo3.Price.from_str(str(float(p)))
-                size = na_pyo3.Quantity.from_str(str(float(s)))
-                bo = na_pyo3.BookOrder(side=na_pyo3.OrderSide.SELL, price=price, size=size, order_id=0)
-                deltas.append(na_pyo3.OrderBookDelta(instrument_id=py_iid, action=na_pyo3.BookAction.ADD, order=bo, flags=flags, sequence=0, ts_event=ts_event, ts_init=ts_init))
+                price = round(float(p), yes_instrument.price_precision)
+                size = float(s)
+                yes_deltas.append(
+                    _make_single_delta(
+                        yes_instrument,
+                        BookAction.ADD,
+                        OrderSide.SELL,
+                        price,
+                        size,
+                        f_snapshot,
+                        ts_event,
+                        ts_init,
+                    ),
+                )
+                no_deltas.append(
+                    _make_single_delta(
+                        no_instrument,
+                        BookAction.ADD,
+                        OrderSide.BUY,
+                        round(_complement_price(price), no_instrument.price_precision),
+                        size,
+                        f_snapshot,
+                        ts_event,
+                        ts_init,
+                    ),
+                )
 
-            if len(deltas) > 1:
-                batch = na_pyo3.OrderBookDeltas(instrument_id=py_iid, deltas=deltas)
-                pyo3_deltas_batches.append(batch)
+            if len(yes_deltas) > 1:
+                last = yes_deltas[-1]
+                yes_deltas[-1] = OrderBookDelta(
+                    instrument_id=last.instrument_id,
+                    action=last.action,
+                    order=last.order,
+                    flags=last.flags | f_last,
+                    sequence=last.sequence,
+                    ts_event=last.ts_event,
+                    ts_init=last.ts_init,
+                )
+                yes_batches.append(OrderBookDeltas(instrument_id=yes_instrument.id, deltas=yes_deltas))
+
+            if len(no_deltas) > 1:
+                last = no_deltas[-1]
+                no_deltas[-1] = OrderBookDelta(
+                    instrument_id=last.instrument_id,
+                    action=last.action,
+                    order=last.order,
+                    flags=last.flags | f_last,
+                    sequence=last.sequence,
+                    ts_event=last.ts_event,
+                    ts_init=last.ts_init,
+                )
+                no_batches.append(OrderBookDeltas(instrument_id=no_instrument.id, deltas=no_deltas))
 
         elif ev == "price_change":
             p = row.get("pc_price")
             s = row.get("pc_size")
             side_str = str(row.get("pc_side") or "").upper()
-            if p is None or pd.isna(p): continue
-            side = na_pyo3.OrderSide.BUY if side_str == "BUY" else na_pyo3.OrderSide.SELL
-            qty_f = 0.0 if (pd.isna(s) or float(s) <= 0) else float(s)
-            action = na_pyo3.BookAction.DELETE if qty_f <= 0 else na_pyo3.BookAction.UPDATE
-            price = na_pyo3.Price.from_str(str(float(p)))
-            size = na_pyo3.Quantity.from_str(str(qty_f))
-            bo = na_pyo3.BookOrder(side=side, price=price, size=size, order_id=0)
-            delta = na_pyo3.OrderBookDelta(instrument_id=py_iid, action=action, order=bo, flags=na_pyo3.RecordFlag.F_LAST, sequence=0, ts_event=ts_event, ts_init=ts_init)
-            batch = na_pyo3.OrderBookDeltas(instrument_id=py_iid, deltas=[delta])
-            pyo3_deltas_batches.append(batch)
+            if p is None or pd.isna(p):
+                continue
+
+            qty = 0.0 if pd.isna(s) or float(s) <= 0.0 else float(s)
+            action = BookAction.DELETE if qty <= 0.0 else BookAction.UPDATE
+            yes_side = OrderSide.BUY if side_str == "BUY" else OrderSide.SELL
+            no_side = OrderSide.SELL if yes_side == OrderSide.BUY else OrderSide.BUY
+            price = round(float(p), yes_instrument.price_precision)
+            no_price = round(_complement_price(price), no_instrument.price_precision)
+
+            yes_batches.append(
+                OrderBookDeltas(
+                    instrument_id=yes_instrument.id,
+                    deltas=[
+                        _make_single_delta(
+                            yes_instrument,
+                            action,
+                            yes_side,
+                            price,
+                            qty,
+                            f_last,
+                            ts_event,
+                            ts_init,
+                        ),
+                    ],
+                ),
+            )
+            no_batches.append(
+                OrderBookDeltas(
+                    instrument_id=no_instrument.id,
+                    deltas=[
+                        _make_single_delta(
+                            no_instrument,
+                            action,
+                            no_side,
+                            no_price,
+                            qty,
+                            f_last,
+                            ts_event,
+                            ts_init,
+                        ),
+                    ],
+                ),
+            )
 
         elif ev == "last_trade_price":
             price_f = row.get("trade_price")
             size_f = row.get("trade_size")
             side_str = str(row.get("trade_side") or "").upper()
-            if price_f is None or pd.isna(price_f): continue
-            aggressor = na_pyo3.AggressorSide.BUYER if side_str == "BUY" else na_pyo3.AggressorSide.SELLER
-            price = na_pyo3.Price.from_str(str(float(price_f)))
-            size = na_pyo3.Quantity.from_str(str(float(size_f) if size_f is not None and not pd.isna(size_f) else 0.0))
-            trade = na_pyo3.TradeTick(instrument_id=py_iid, price=price, size=size, aggressor_side=aggressor, trade_id=na_pyo3.TradeId(str(row.get("hash") or f"pm-{ts_event}")), ts_event=ts_event, ts_init=ts_init)
-            pyo3_trades.append(trade)
+            if price_f is None or pd.isna(price_f):
+                continue
 
-    return pyo3_deltas_batches, pyo3_trades
+            qty = float(size_f) if size_f is not None and not pd.isna(size_f) else 0.0
+            yes_price = yes_instrument.make_price(round(float(price_f), yes_instrument.price_precision))
+            no_price = no_instrument.make_price(
+                round(_complement_price(float(price_f)), no_instrument.price_precision),
+            )
+            yes_aggressor = AggressorSide.BUYER if side_str == "BUY" else AggressorSide.SELLER
+            no_aggressor = AggressorSide.SELLER if yes_aggressor == AggressorSide.BUYER else AggressorSide.BUYER
+
+            yes_trades.append(
+                TradeTick(
+                    instrument_id=yes_instrument.id,
+                    price=yes_price,
+                    size=yes_instrument.make_qty(qty),
+                    aggressor_side=yes_aggressor,
+                    trade_id=TradeId(_build_trade_id(row, ts_event, "yes")),
+                    ts_event=ts_event,
+                    ts_init=ts_init,
+                ),
+            )
+            no_trades.append(
+                TradeTick(
+                    instrument_id=no_instrument.id,
+                    price=no_price,
+                    size=no_instrument.make_qty(qty),
+                    aggressor_side=no_aggressor,
+                    trade_id=TradeId(_build_trade_id(row, ts_event, "no")),
+                    ts_event=ts_event,
+                    ts_init=ts_init,
+                ),
+            )
+
+        elif ev == "market_resolved":
+            winner = str(row.get("winning_outcome") or "").strip().lower()
+            yes_close_px = 1.0 if winner in {"yes", "up", "higher", "above"} else 0.0
+            no_close_px = 1.0 - yes_close_px
+            closes.append(
+                InstrumentClose(
+                    instrument_id=yes_instrument.id,
+                    close_price=yes_instrument.make_price(yes_close_px),
+                    close_type=InstrumentCloseType.CONTRACT_EXPIRED,
+                    ts_event=ts_event,
+                    ts_init=ts_init,
+                ),
+            )
+            closes.append(
+                InstrumentClose(
+                    instrument_id=no_instrument.id,
+                    close_price=no_instrument.make_price(no_close_px),
+                    close_type=InstrumentCloseType.CONTRACT_EXPIRED,
+                    ts_event=ts_event,
+                    ts_init=ts_init,
+                ),
+            )
+
+    return yes_batches, yes_trades, no_batches, no_trades, closes
 
 
-def _write_instrument_and_data(catalog_path: str, instrument: BinaryOption, deltas: list, trades: list = None):
-    """简洁写入：先 instrument，再 data。pyo3 对象。"""
-    os.makedirs(catalog_path, exist_ok=True)
-    cat = ParquetDataCatalog(catalog_path)
-    cat.write_data([instrument])
-    if deltas:
-        cat.write_data(deltas)
-    if trades:
-        cat.write_data(trades)
-    print(f"Written to {catalog_path}")
+def _write_data(catalog_path: str, data: list[Any]) -> None:
+    if not data:
+        return
+    ParquetDataCatalog(catalog_path).write_data(data)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--slug", required=True)
     parser.add_argument("--data-type", default="poly_l2")
@@ -348,28 +588,39 @@ def main():
 
     if args.clean:
         import shutil
-        for p in (TARGET_CATALOG, DATA_DIR):
-            if os.path.exists(p):
-                shutil.rmtree(p, ignore_errors=True)
-                print(f"Removed previous {p}")
+
+        for path in (args.catalog, DATA_DIR):
+            if os.path.exists(path):
+                shutil.rmtree(path, ignore_errors=True)
+                print(f"Removed previous {path}")
         os.makedirs(DATA_DIR, exist_ok=True)
-        os.makedirs(TARGET_CATALOG, exist_ok=True)
+        os.makedirs(args.catalog, exist_ok=True)
 
     df = download_pmdata(args.slug, args.data_type, args.api_key, force=args.force_download)
-
     if args.download_only:
-        print(f"Download complete. Data in ./data/{args.slug}.parquet")
+        print(f"Download complete. Data in {DATA_DIR}/{args.slug}.parquet")
         return
 
-    instrument = get_pm_instrument(args.slug)
-    pyo3_deltas, pyo3_trades = pmdata_parquet_to_nautilus_pyo3(df, instrument)
+    yes_instrument, no_instrument = get_pm_instruments(args.slug)
+    yes_deltas, yes_trades, no_deltas, no_trades, closes = pmdata_parquet_to_nautilus(
+        df,
+        yes_instrument,
+        no_instrument,
+    )
 
-    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(args.catalog, exist_ok=True)
+    _write_data(args.catalog, [yes_instrument, no_instrument])
+    _write_data(args.catalog, yes_deltas)
+    _write_data(args.catalog, no_deltas)
+    _write_data(args.catalog, yes_trades)
+    _write_data(args.catalog, no_trades)
+    _write_data(args.catalog, closes)
 
-    print(f"Writing instrument + {len(pyo3_deltas)} native pyO3 OrderBookDeltas + {len(pyo3_trades)} native pyO3 trades")
-    _write_instrument_and_data(TARGET_CATALOG, instrument, pyo3_deltas, pyo3_trades)
-
-    cat = ParquetDataCatalog(TARGET_CATALOG)
+    print(
+        f"Wrote instruments + yes_deltas={len(yes_deltas)} no_deltas={len(no_deltas)} "
+        f"yes_trades={len(yes_trades)} no_trades={len(no_trades)} closes={len(closes)}",
+    )
+    cat = ParquetDataCatalog(args.catalog)
     print("Catalog instruments:", [str(i.id) for i in cat.instruments()])
 
 

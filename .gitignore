@@ -36,3 +36,9 @@ wheels/
 # OS
 .DS_Store
 Thumbs.db
+
+# Generated outputs
+bolt_repro/outputs/
+
+# bolt_repro generated results
+bolt_repro/outputs/

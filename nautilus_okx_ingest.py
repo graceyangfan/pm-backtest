@@ -14,21 +14,27 @@ OKX spot L2 historical orderbook data ingest to Nautilus catalog (pyo3 native).
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import shutil
 import tarfile
+from collections.abc import Iterator
+from decimal import Decimal
 from typing import Any
 
 import requests
 
+from nautilus_trader.model.currencies import Currency
+from nautilus_trader.model.data import BookOrder, OrderBookDelta, OrderBookDeltas
+from nautilus_trader.model.enums import BookAction, OrderSide, RecordFlag
 from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.identifiers import Symbol
 from nautilus_trader.model.instruments import CurrencyPair, instruments_from_pyo3
+from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 from nautilus_trader.core import nautilus_pyo3 as na_pyo3
-
-import asyncio
 
 PM_BACKTEST_ROOT = "/Users/yfclark/pm_backtest"
 TARGET_CATALOG = "/Users/yfclark/pm_backtest/catalog"
@@ -47,7 +53,7 @@ def _write_instrument_and_data(catalog_path: str, instrument: CurrencyPair, data
 
 
 def get_okx_spot_instrument(symbol: str = "BTC-USDT") -> CurrencyPair:
-    """从 OKX live adapter 真实获取 (推荐, 避免手动构造错误)."""
+    """Get OKX spot instrument, with offline fallback for local backtests."""
     async def _fetch() -> CurrencyPair:
         print(f"Fetching instrument {symbol} from OKX live adapter (public HTTP)...")
         client = na_pyo3.OKXHttpClient(
@@ -68,7 +74,33 @@ def get_okx_spot_instrument(symbol: str = "BTC-USDT") -> CurrencyPair:
                 return inst
         raise RuntimeError(f"Could not find {symbol}")
 
-    return asyncio.run(_fetch())
+    try:
+        return asyncio.run(_fetch())
+    except Exception as e:
+        print(f"Live OKX instrument fetch failed ({e}), using deterministic offline fallback.")
+        return _make_okx_spot_instrument_fallback(symbol)
+
+
+def _make_okx_spot_instrument_fallback(symbol: str) -> CurrencyPair:
+    base_code, quote_code = symbol.split("-", 1)
+    price_increment = Price.from_str("0.00000001")
+    size_increment = Quantity.from_str("0.00000001")
+    ts_now = 0
+    return CurrencyPair(
+        instrument_id=InstrumentId.from_str(f"{symbol}.OKX"),
+        raw_symbol=Symbol(symbol),
+        base_currency=Currency.from_str(base_code),
+        quote_currency=Currency.from_str(quote_code),
+        price_precision=price_increment.precision,
+        size_precision=size_increment.precision,
+        price_increment=price_increment,
+        size_increment=size_increment,
+        ts_event=ts_now,
+        ts_init=ts_now,
+        maker_fee=Decimal("0"),
+        taker_fee=Decimal("0"),
+        info={"source": "offline_fallback", "symbol": symbol},
+    )
 
 
 def write_okx_spot_instruments(symbols: list[str] | None = None, catalog_path: str = TARGET_CATALOG):
@@ -95,13 +127,16 @@ def write_okx_spot_instruments(symbols: list[str] | None = None, catalog_path: s
             client.cache_instrument(py_inst)
         return instruments_from_pyo3(pyo3_instruments)
 
-    all_insts = asyncio.run(_fetch_all())
+    try:
+        all_insts = asyncio.run(_fetch_all())
+    except Exception as e:
+        print(f"Bulk OKX instrument fetch failed ({e}), using offline fallbacks.")
+        all_insts = []
     inst_map = {str(i.id).split(".")[0]: i for i in all_insts}  # e.g. "BTC-USDT" -> inst
 
     for sym in symbols:
         inst = inst_map.get(sym)
         if inst is None:
-            # fallback to single fetch (rare)
             inst = get_okx_spot_instrument(sym)
         cat.write_data([inst])
         print(f"✓ Written instrument: {inst.id}")
@@ -160,18 +195,153 @@ def load_okx_spot_l2_to_pyo3(path: str, instrument: CurrencyPair) -> list:
     格式：每行一个 snapshot JSON
     {"instId": "...", "ts": "...", "bids": [[price, size, ...], ...], "asks": [[...]] }
     """
+    pyo3_deltas = []
+    for chunk in iter_okx_spot_l2_batches(path, instrument, chunk_size=20_000):
+        pyo3_deltas.extend(d.to_pyo3() for d in chunk)
+    return pyo3_deltas
+
+
+def _parse_okx_row_to_deltas(
+    row: dict[str, Any],
+    instrument: CurrencyPair,
+) -> OrderBookDeltas | None:
+    """Parse one OKX historical row into a high-level OrderBookDeltas batch."""
+    # OKX historical L2 timestamps are milliseconds.
+    ts = int(row.get("ts", 0))
+    ts_ns = ts * 1_000_000
+    action = str(row.get("action") or "").lower()
+
+    bids_lv = (row.get("bids", []) or [])[:400]
+    asks_lv = (row.get("asks", []) or [])[:400]
+    deltas: list[OrderBookDelta] = []
+
+    if action == "snapshot":
+        deltas.append(
+            OrderBookDelta(
+                instrument_id=instrument.id,
+                action=BookAction.CLEAR,
+                order=None,
+                flags=RecordFlag.F_SNAPSHOT,
+                sequence=0,
+                ts_event=ts_ns,
+                ts_init=ts_ns,
+            )
+        )
+
+        for level in bids_lv:
+            if len(level) < 2 or float(level[1]) <= 0:
+                continue
+            bo = BookOrder(
+                side=OrderSide.BUY,
+                price=instrument.make_price(float(level[0])),
+                size=instrument.make_qty(float(level[1])),
+                order_id=0,
+            )
+            deltas.append(
+                OrderBookDelta(
+                    instrument_id=instrument.id,
+                    action=BookAction.ADD,
+                    order=bo,
+                    flags=RecordFlag.F_SNAPSHOT,
+                    sequence=0,
+                    ts_event=ts_ns,
+                    ts_init=ts_ns,
+                )
+            )
+
+        for level in asks_lv:
+            if len(level) < 2 or float(level[1]) <= 0:
+                continue
+            bo = BookOrder(
+                side=OrderSide.SELL,
+                price=instrument.make_price(float(level[0])),
+                size=instrument.make_qty(float(level[1])),
+                order_id=0,
+            )
+            deltas.append(
+                OrderBookDelta(
+                    instrument_id=instrument.id,
+                    action=BookAction.ADD,
+                    order=bo,
+                    flags=RecordFlag.F_SNAPSHOT,
+                    sequence=0,
+                    ts_event=ts_ns,
+                    ts_init=ts_ns,
+                )
+            )
+    else:
+        for level in bids_lv:
+            if len(level) < 2:
+                continue
+            size = float(level[1])
+            bo = BookOrder(
+                side=OrderSide.BUY,
+                price=instrument.make_price(float(level[0])),
+                size=instrument.make_qty(0.0 if size <= 0 else size),
+                order_id=0,
+            )
+            deltas.append(
+                OrderBookDelta(
+                    instrument_id=instrument.id,
+                    action=BookAction.DELETE if size <= 0 else BookAction.UPDATE,
+                    order=bo,
+                    flags=0,
+                    sequence=0,
+                    ts_event=ts_ns,
+                    ts_init=ts_ns,
+                )
+            )
+
+        for level in asks_lv:
+            if len(level) < 2:
+                continue
+            size = float(level[1])
+            bo = BookOrder(
+                side=OrderSide.SELL,
+                price=instrument.make_price(float(level[0])),
+                size=instrument.make_qty(0.0 if size <= 0 else size),
+                order_id=0,
+            )
+            deltas.append(
+                OrderBookDelta(
+                    instrument_id=instrument.id,
+                    action=BookAction.DELETE if size <= 0 else BookAction.UPDATE,
+                    order=bo,
+                    flags=0,
+                    sequence=0,
+                    ts_event=ts_ns,
+                    ts_init=ts_ns,
+                )
+            )
+
+    if not deltas:
+        return None
+
+    last = deltas[-1]
+    deltas[-1] = OrderBookDelta(
+        instrument_id=last.instrument_id,
+        action=last.action,
+        order=last.order,
+        flags=last.flags | RecordFlag.F_LAST,
+        sequence=last.sequence,
+        ts_event=last.ts_event,
+        ts_init=last.ts_init,
+    )
+    return OrderBookDeltas(instrument_id=instrument.id, deltas=deltas)
+
+
+def iter_okx_spot_l2_batches(
+    path: str,
+    instrument: CurrencyPair,
+    chunk_size: int = 20_000,
+) -> Iterator[list[OrderBookDeltas]]:
+    """Stream OKX historical rows into high-level Nautilus OrderBookDeltas chunks."""
     if not path.endswith(".data"):
         raise ValueError(f"Expected .data file, got: {path}")
 
-    pyo3_deltas = []
-    py_iid = na_pyo3.InstrumentId.from_str(str(instrument.id))
-
-    # Use enum values (matches model/enums.py:438-440 and PM side usage)
-    F_S = na_pyo3.RecordFlag.F_SNAPSHOT
-    F_L = na_pyo3.RecordFlag.F_LAST
-
     # Derive expected instId from instrument for validation (e.g. "BTC-USDT")
     expected_inst = str(instrument.id).split(".")[0]
+    chunk: list[OrderBookDeltas] = []
 
     with open(path, "r") as f:
         for line in f:
@@ -184,101 +354,16 @@ def load_okx_spot_l2_to_pyo3(path: str, instrument: CurrencyPair) -> list:
             row_inst = row.get("instId")
             if row_inst and row_inst != expected_inst:
                 continue
+            batch = _parse_okx_row_to_deltas(row, instrument)
+            if batch is None:
+                continue
+            chunk.append(batch)
+            if len(chunk) >= chunk_size:
+                yield chunk
+                chunk = []
 
-            # OKX L2 orderbook historical (.data NDJSON) "ts" unit is MILLISECONDS.
-            # Hard rule for this source only — no guessing.
-            #
-            # Verified:
-            # 1. OKX docs (multiple pages): "Unix timestamp format in milliseconds, e.g. 1597026383085"
-            # 2. Actual file from https://www.okx.com/historical-data (2026-06-19 BTC-USDT):
-            #    ts=1781827200005 → 1781827200.005 seconds = exactly the date in the filename.
-            # 3. Consistent with all OKX L2 snapshot / books data.
-            #
-            # Nautilus = nanoseconds.
-            ts = int(row.get("ts", 0))
-            ts_ns = ts * 1_000_000   # ms → ns (definitive for OKX historical L2)
-
-            bids = row.get("bids", []) or []
-            asks = row.get("asks", []) or []
-
-            # Limit to 400 levels (matches the 400lv tarball format)
-            bids_lv = bids[:400]
-            asks_lv = asks[:400]
-
-            deltas = []
-            # Use order=None for CLEAR to be consistent with Polymarket adapter schema
-            # (schemas/book.py:70) and other Nautilus snapshot patterns.
-            clear = na_pyo3.OrderBookDelta(
-                instrument_id=py_iid,
-                action=na_pyo3.BookAction.CLEAR,
-                order=None,
-                flags=F_S,
-                sequence=0,
-                ts_event=ts_ns,
-                ts_init=ts_ns,
-            )
-            deltas.append(clear)
-
-            for i, level in enumerate(bids_lv):
-                if len(level) < 2:
-                    continue
-                size_str = str(level[1])
-                if float(size_str) <= 0:
-                    continue
-                bo = na_pyo3.BookOrder(
-                    side=na_pyo3.OrderSide.BUY,
-                    price=na_pyo3.Price.from_str(str(level[0])),
-                    size=na_pyo3.Quantity.from_str(size_str),
-                    order_id=0,
-                )
-                flags = F_S
-                if i == len(bids_lv) - 1 and not asks_lv:
-                    flags |= F_L
-                deltas.append(
-                    na_pyo3.OrderBookDelta(
-                        instrument_id=py_iid,
-                        action=na_pyo3.BookAction.ADD,
-                        order=bo,
-                        flags=flags,
-                        sequence=0,
-                        ts_event=ts_ns,
-                        ts_init=ts_ns,
-                    )
-                )
-
-            for i, level in enumerate(asks_lv):
-                if len(level) < 2:
-                    continue
-                size_str = str(level[1])
-                if float(size_str) <= 0:
-                    continue
-                bo = na_pyo3.BookOrder(
-                    side=na_pyo3.OrderSide.SELL,
-                    price=na_pyo3.Price.from_str(str(level[0])),
-                    size=na_pyo3.Quantity.from_str(size_str),
-                    order_id=0,
-                )
-                flags = F_S
-                if i == len(asks_lv) - 1:
-                    flags |= F_L
-                deltas.append(
-                    na_pyo3.OrderBookDelta(
-                        instrument_id=py_iid,
-                        action=na_pyo3.BookAction.ADD,
-                        order=bo,
-                        flags=flags,
-                        sequence=0,
-                        ts_event=ts_ns,
-                        ts_init=ts_ns,
-                    )
-                )
-
-            if len(deltas) > 1:
-                # Emit batch only when we have CLEAR + at least one level.
-                # Pattern mirrors deribit/data.py:731 and polymarket book snapshots.
-                pyo3_deltas.append(na_pyo3.OrderBookDeltas(instrument_id=py_iid, deltas=deltas))
-
-    return pyo3_deltas
+    if chunk:
+        yield chunk
 
 
 def main():
@@ -314,13 +399,18 @@ def main():
         if not args.data_file:
             raise SystemExit("--data-file is required")
         inst = get_okx_spot_instrument(args.symbol)
-        deltas = load_okx_spot_l2_to_pyo3(args.data_file, inst)
-
-        _write_instrument_and_data(TARGET_CATALOG, inst, deltas)
-
+        os.makedirs(TARGET_CATALOG, exist_ok=True)
         cat = ParquetDataCatalog(TARGET_CATALOG)
-        read = list(cat.query_order_book_deltas(instrument_ids=[inst.id]))
-        print(f"Read back {len(read)} OrderBookDeltas batches")
+        cat.write_data([inst])
+
+        written = 0
+        for chunk in iter_okx_spot_l2_batches(args.data_file, inst):
+            cat.write_data(chunk)
+            written += len(chunk)
+            print(f"Wrote {written:_} OKX delta batches...")
+
+        # Use order_book_deltas (batched=True to get the batch objects)
+        print(f"Finished writing {written:_} OrderBookDeltas batches")
 
 
 if __name__ == "__main__":
